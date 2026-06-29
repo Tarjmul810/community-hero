@@ -1,0 +1,233 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum IssueCategory {
+  POTHOLE
+  STREETLIGHT
+  WATER_SUPPLY
+  WASTE_MANAGEMENT
+  ROAD_DAMAGE
+  DRAINAGE
+  NOISE_POLLUTION
+  OTHER
+}
+
+enum Severity {
+  MINOR
+  MODERATE
+  CRITICAL
+}
+
+enum IssueStatus {
+  REPORTED
+  VERIFIED
+  IN_PROGRESS
+  RESOLVED
+  ESCALATED
+  DUPLICATE
+}
+
+enum BadgeType {
+  FIRST_REPORT
+  COMMUNITY_HERO
+  VERIFIED_REPORTER
+  TOP_CONTRIBUTOR
+  AREA_GUARDIAN
+}
+
+enum VoteType {
+  UPVOTE   // community confirms issue exists
+  VERIFY   // stronger: "I witnessed this too"
+}
+
+// ─────────────────────────────────────────────
+// USER
+// ─────────────────────────────────────────────
+
+model User {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  avatarUrl     String?
+  preferredLang String   @default("en") // for Google Translate
+  points        Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  issues        Issue[]
+  votes         Vote[]
+  badges        UserBadge[]
+  comments      IssueComment[]
+
+  @@index([points]) // for leaderboard queries
+}
+
+// ─────────────────────────────────────────────
+// ISSUE  (core entity)
+// ─────────────────────────────────────────────
+
+model Issue {
+  id          String        @id @default(cuid())
+  title       String
+  description String        @db.Text
+  category    IssueCategory
+  severity    Severity
+  status      IssueStatus   @default(REPORTED)
+
+  // Media
+  imageUrl    String
+  imageHash   String?       // perceptual hash for duplicate detection
+
+  // Geo
+  latitude    Float
+  longitude   Float
+  address     String
+  locality    String?       // neighbourhood / sector — for area pattern queries
+  city        String?
+  pincode     String?
+
+  // AI-generated fields
+  aiDescription   String?  @db.Text  // Gemini Vision output
+  aiSeverityScore Float?              // 0.0 – 1.0 raw score before bucketing
+  resolution      String?  @db.Text  // AI fix suggestion
+  impactEstimate  String?  @db.Text  // AI community impact
+  areaInsight     String?  @db.Text  // "Sector 4 pattern detected"
+
+  // Duplicate detection
+  isDuplicate     Boolean  @default(false)
+  duplicateOfId   String?  // points to the canonical issue
+  duplicateOf     Issue?   @relation("DuplicateIssues", fields: [duplicateOfId], references: [id])
+  duplicates      Issue[]  @relation("DuplicateIssues")
+
+  // Escalation
+  escalatedAt     DateTime?
+  resolvedAt      DateTime?
+
+  // Soft-delete
+  deletedAt       DateTime?
+
+  // Relations
+  userId      String
+  user        User           @relation(fields: [userId], references: [id])
+  votes       Vote[]
+  comments    IssueComment[]
+  statusLogs  IssueStatusLog[]
+  tags        IssueTag[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([latitude, longitude])   // geo bounding-box queries
+  @@index([status])
+  @@index([category])
+  @@index([locality, category])    // area pattern detection
+  @@index([imageHash])             // fast duplicate lookup
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// VOTE  (upvote + verify, one per user per issue)
+// ─────────────────────────────────────────────
+
+model Vote {
+  id        String   @id @default(cuid())
+  type      VoteType @default(UPVOTE)
+  userId    String
+  issueId   String
+  user      User     @relation(fields: [userId], references: [id])
+  issue     Issue    @relation(fields: [issueId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([userId, issueId])      // one vote per user per issue
+  @@index([issueId])
+}
+
+// ─────────────────────────────────────────────
+// STATUS AUDIT LOG  (full history, powers timeline UI)
+// ─────────────────────────────────────────────
+
+model IssueStatusLog {
+  id        String      @id @default(cuid())
+  issueId   String
+  issue     Issue       @relation(fields: [issueId], references: [id])
+  fromStatus IssueStatus?
+  toStatus  IssueStatus
+  note      String?
+  changedBy String?     // userId or "system" or "ai"
+  createdAt DateTime    @default(now())
+
+  @@index([issueId])
+}
+
+// ─────────────────────────────────────────────
+// COMMENT  (community discussion on an issue)
+// ─────────────────────────────────────────────
+
+model IssueComment {
+  id        String   @id @default(cuid())
+  body      String   @db.Text
+  isAiGenerated Boolean @default(false)
+  issueId   String
+  userId    String
+  issue     Issue    @relation(fields: [issueId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([issueId])
+}
+
+// ─────────────────────────────────────────────
+// BADGES  (many-to-many with metadata)
+// ─────────────────────────────────────────────
+
+model Badge {
+  id          String      @id @default(cuid())
+  type        BadgeType   @unique
+  name        String
+  description String
+  iconUrl     String?
+  pointsValue Int         @default(0)
+  users       UserBadge[]
+}
+
+model UserBadge {
+  id        String   @id @default(cuid())
+  userId    String
+  badgeId   String
+  user      User     @relation(fields: [userId], references: [id])
+  badge     Badge    @relation(fields: [badgeId], references: [id])
+  awardedAt DateTime @default(now())
+
+  @@unique([userId, badgeId])
+}
+
+// ─────────────────────────────────────────────
+// TAGS  (flexible labelling, e.g. "monsoon", "repeat-offender")
+// ─────────────────────────────────────────────
+
+model Tag {
+  id     String     @id @default(cuid())
+  name   String     @unique
+  issues IssueTag[]
+}
+
+model IssueTag {
+  issueId String
+  tagId   String
+  issue   Issue  @relation(fields: [issueId], references: [id])
+  tag     Tag    @relation(fields: [tagId], references: [id])
+
+  @@id([issueId, tagId])
+}
